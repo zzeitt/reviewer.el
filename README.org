@@ -29,6 +29,10 @@ https://github.com/user-attachments/assets/99aa946f-55a2-444f-8cae-292e24cfb378
   overlapping the active region.
 - ~reviewer-clear-annotations~ :: Delete all annotations in the
   current buffer.
+- ~reviewer-save-annotations~ :: Write every annotation under the
+  current git repository to =<repo-root>/.reviewer/annotations.json=,
+  for an external agent to read. Normally runs automatically after
+  each annotation change; see [[*Agent handoff (persistence to disk)][Agent handoff]].
 - ~reviewer-render~ :: Render all annotations in the buffer as an org
   file in =/tmp/=, displayed in a =*reviewer:file*= buffer.
   ~reviewer-render-next-annotation~ and
@@ -62,6 +66,50 @@ current buffer), and "project" (the same commands, project-wide). Set
 instead, dispatching straight to each command with no menu shown.
 
 [[./images/transient.gif]]
+
+** Agent handoff (persistence to disk)
+
+Annotating writes the review through to disk automatically, so an
+external agent can read it without reaching into the running Emacs.
+After every create, edit, reply, or delete, ~reviewer-save-annotations~
+writes =<repo-root>/.reviewer/annotations.json= for the current git
+repository. Run it yourself with ~M-x reviewer-save-annotations~ to
+force a write.
+
+The file records the repository's ~head~ and ~branch~, the annotated
+~files~, and one object per annotation:
+
+#+BEGIN_SRC js
+{
+  "head": "4f3e89c...",
+  "branch": "master",
+  "file": "src/main.c",          // set only when one file is annotated
+  "files": ["src/main.c", "src/util.c"],
+  "annotations": [
+    {
+      "id": "20261017T121809-96c2",
+      "file": "src/main.c",
+      "start_line": 10,
+      "end_line": 12,
+      "text": "the quoted source span\n",
+      "note": "This leaks the fd on error.",
+      "author": "you",
+      "status": "open",
+      "replies": [
+        { "author": "you", "time": "12:18", "text": "Fixed next commit." }
+      ]
+    }
+  ]
+}
+#+END_SRC
+
+Annotations are collected across every live annotated buffer under the
+repository, so annotating a second file does not overwrite the first
+one's. Buffers outside a git repository are not persisted.
+
+The file is written, not reloaded: reopening Emacs starts with an empty
+review. Add ~.reviewer/~ to the reviewed repository's =.gitignore= (or
+its =.git/info/exclude=) so the review stays out of commits.
 
 * The treemacs tree/detail view
 
@@ -197,8 +245,13 @@ that view.
 - ~reviewer-annotation-change-hook~ :: Runs after an annotation is
   created, edited, replied to, or deleted, with no arguments. Hook
   your own automation into this if you want something to happen every
-  time an annotation changes -- it's what the treemacs view itself
-  uses to keep its tree in sync.
+  time an annotation changes -- it's what the treemacs view and the
+  persistence layer both use.
+- ~reviewer-store-dir~ :: Directory, relative to the repository root,
+  where ~reviewer-save-annotations~ writes =annotations.json=.
+- ~reviewer-auto-save-annotations~ :: Whether to persist after every
+  annotation change. Default ~t~; set it to ~nil~ to write only when
+  you call ~reviewer-save-annotations~ yourself.
 
 A full sample configuration, documenting each of these:
 
@@ -213,6 +266,10 @@ A full sample configuration, documenting each of these:
   (reviewer-posframe-parameters '(:border-width 2 :fringe 16 :width 40 :min-height 5))
   ;; Load the treemacs tree/detail view.
   (reviewer-enable-treemacs t)
+  ;; Persist annotations after every change (the default).
+  (reviewer-auto-save-annotations t)
+  ;; Where the handoff file lives, relative to the repository root.
+  (reviewer-store-dir ".reviewer")
   :custom-face
   ;; Highlight for the annotated region itself.
   (reviewer-highlight-face ((t :inherit highlight)))
@@ -231,9 +288,10 @@ A full sample configuration, documenting each of these:
 * Status
 
 ~reviewer-mode~ (create, edit, reply to, and show annotations), the
-org renderer (single-buffer and project-wide), and the treemacs
-tree/detail view are all in place. There's no persistence across
-sessions yet.
+org renderer (single-buffer and project-wide), the treemacs tree/detail
+view, and write-through persistence to =.reviewer/annotations.json=
+for agent handoff are all in place. Annotations are not reloaded from
+that file when Emacs restarts.
 
 * Comparison to related packages
 
@@ -252,6 +310,8 @@ guide an agent while it writes or edits code.
 reviewer.el is similar in spirit to annotate.el: both are built around
 a region- or word-triggered, in-place-editable annotation that leaves
 the file's content untouched. annotate.el additionally persists
-annotations to a database across sessions; reviewer.el adds a posframe
-and a treemacs sidebar for viewing annotations, and a transient menu
-for discovering commands, none of which annotate.el has.
+annotations to a database across sessions; reviewer.el writes a JSON
+handoff file but does not reload annotations from it, and adds a
+posframe and a treemacs sidebar for viewing annotations, plus a
+transient menu for discovering commands, none of which annotate.el
+has.

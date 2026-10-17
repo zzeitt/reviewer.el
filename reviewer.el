@@ -785,5 +785,130 @@ until this is turned on, e.g. via `setopt' or a `:custom' entry in
 (define-globalized-minor-mode reviewer-global-mode reviewer-mode reviewer-mode
   :group 'reviewer)
 
+;;; Persistence (write-through to the repository's .reviewer/ directory)
+
+(require 'json)
+
+(defcustom reviewer-store-dir ".reviewer"
+  "Directory, relative to the repository root, where annotations persist.
+`reviewer-save-annotations' writes `annotations.json' here so an
+external agent can read the review off disk without reaching into the
+running Emacs.  The file is plain JSON; you will usually want this
+directory git-ignored in the repositories you review."
+  :type 'string
+  :group 'reviewer)
+
+(defcustom reviewer-auto-save-annotations t
+  "Whether to persist annotations after every create, edit, reply or delete.
+When non-nil, `reviewer-save-annotations' runs from
+`reviewer-annotation-change-hook'."
+  :type 'boolean
+  :group 'reviewer)
+
+(defun reviewer--git (root &rest args)
+  "Run `git ARGS' with `default-directory' bound to ROOT.
+Return the trimmed stdout on success, or nil if git is unavailable or
+fails."
+  (when (executable-find "git")
+    (let ((default-directory root))
+      (with-temp-buffer
+        (when (zerop (apply #'call-process "git" nil (current-buffer) nil args))
+          (string-trim (buffer-string)))))))
+
+(defun reviewer--repo-root ()
+  "Return the git toplevel for the current buffer's directory, or nil."
+  (reviewer--git default-directory "rev-parse" "--show-toplevel"))
+
+(defun reviewer--git-head (root)
+  "Return ROOT's full HEAD commit hash, or nil."
+  (reviewer--git root "rev-parse" "HEAD"))
+
+(defun reviewer--git-branch (root)
+  "Return ROOT's short branch name, or nil if HEAD is detached."
+  (reviewer--git root "symbolic-ref" "--short" "HEAD"))
+
+(defun reviewer--buffer-key (root)
+  "Return a label for the current buffer within a review rooted at ROOT.
+Its file path relative to ROOT, or \"buffer:<name>\" for a buffer with
+no file, e.g. a magit diff or a scratch buffer."
+  (if buffer-file-name
+      (file-relative-name (expand-file-name buffer-file-name) root)
+    (format "buffer:%s" (buffer-name))))
+
+(defun reviewer--annotation-entry (ov root)
+  "Return annotation OVERLAY as a plist ready for `json-encode'.
+ROOT anchors the file path; positions and quoted text come from the
+current buffer."
+  (list :id         (reviewer-annotation-thread-id ov)
+        :file       (reviewer--buffer-key root)
+        :start_line (line-number-at-pos (overlay-start ov))
+        :end_line   (line-number-at-pos (overlay-end ov))
+        :text       (buffer-substring-no-properties
+                     (overlay-start ov) (overlay-end ov))
+        :note       (reviewer-annotation-text ov)
+        :author     (reviewer-annotation-author ov)
+        :status     (reviewer-annotation-status ov)
+        ;; A vector keeps `json-encode' from mistaking this list of
+        ;; plists for an alist and mangling the reply fields.
+        :replies    (vconcat (reviewer-annotation-replies ov))))
+
+(defun reviewer--repo-annotation-entries (root)
+  "Return annotation entries for every live annotated buffer under ROOT.
+A buffer is included when its visited file, or for a fileless buffer
+such as a magit diff its `default-directory', is under ROOT."
+  (let (entries)
+    (dolist (buf (reviewer--project-buffers root) (nreverse entries))
+      (with-current-buffer buf
+        (dolist (ov (reviewer-all-annotations))
+          (push (reviewer--annotation-entry ov root) entries))))))
+
+(defun reviewer-save-annotations ()
+  "Persist every annotation under the current git repository to disk.
+Writes `reviewer-store-dir'/annotations.json at the repository root,
+recording the repository's head and branch, the annotated files, and
+each annotation's id, file, line range, quoted text, note, author,
+status and replies.  Annotations are collected across every live
+buffer under the repository, so annotating a second file does not
+overwrite the first one's."
+  (interactive)
+  (let ((root (reviewer--repo-root)))
+    (unless root
+      (user-error "Not in a git repository; annotations not persisted"))
+    (let* ((entries (reviewer--repo-annotation-entries root))
+           (files (delete-dups (mapcar (lambda (entry)
+                                         (plist-get entry :file))
+                                       entries)))
+           (dir (expand-file-name reviewer-store-dir root))
+           (path (expand-file-name "annotations.json" dir)))
+      (make-directory dir t)
+      (with-temp-file path
+        (insert (json-encode
+                 (list :head (reviewer--git-head root)
+                       :branch (reviewer--git-branch root)
+                       ;; Convenience for single-file reviews; consumers
+                       ;; should read each annotation's own :file.
+                       :file (and (= 1 (length files)) (car files))
+                       :files (vconcat files)
+                       :annotations (vconcat entries)))))
+      (message "Saved %d annotation%s to %s"
+               (length entries)
+               (if (= 1 (length entries)) "" "s")
+               path))))
+
+(defun reviewer--auto-save-annotations (&rest _)
+  "Persist annotations after a change to any annotation under the repo.
+Buffers outside a git repository are skipped quietly.  Real failures
+are reported as a warning rather than silently dropping the review."
+  (when reviewer-auto-save-annotations
+    (condition-case err
+        (reviewer-save-annotations)
+      (user-error nil)                  ; no repo: nothing to persist
+      (error
+       (display-warning 'reviewer
+                        (format "Could not persist annotations: %s"
+                                (error-message-string err)))))))
+
+(add-hook 'reviewer-annotation-change-hook #'reviewer--auto-save-annotations)
+
 (provide 'reviewer)
 ;;; reviewer.el ends here
